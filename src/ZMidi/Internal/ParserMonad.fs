@@ -4,7 +4,8 @@ namespace ZMidi.Internal
 module ParserMonad = 
 
     open System.IO
-
+    open FSharpPlus
+    open FSharpPlus.Data
     open ZMidi.Internal.Utils
 
     /// Status is either OFF or the previous VoiceEvent * Channel.
@@ -85,8 +86,7 @@ module ParserMonad =
         #endif
       )
 
-    type ParserMonad<'a> = 
-        ParserMonad of (MidiData -> State -> Result<'a * State, ParseError> )
+    type ParserMonad<'a> = ReaderT<MidiData,StateT<State,Result<'a * State, ParseError>>>
 
     let nullOut = new StreamWriter(Stream.Null) :> TextWriter
     let mutable debug = false
@@ -100,7 +100,7 @@ module ParserMonad =
     let inline private apply1 (parser : ParserMonad<'a>) 
                        (midiData : byte[])
                        (state : State)  :  Result<'a * State, ParseError> = 
-        let (ParserMonad fn) = parser 
+        let fn = ReaderT.run parser >> StateT.run
         try
             let result = fn midiData state
             let oldState = state
@@ -129,8 +129,9 @@ module ParserMonad =
                                 )
                   )
             
+    let ParserMonad f = ReaderT (fun r -> StateT (fun s -> f r s))
     let inline mreturn (x:'a) : ParserMonad<'a> = 
-        ParserMonad <| fun _ st -> Ok (x, st)
+        ReaderT <| fun _ -> StateT (fun st -> Ok (x, st))
 
     let inline private bindM (parser : ParserMonad<'a>) 
                       (next : 'a -> ParserMonad<'b>) : ParserMonad<'b> = 
@@ -156,31 +157,8 @@ module ParserMonad =
 
     let (>>=) (m: ParserMonad<'a>) (k: 'a -> ParserMonad<'b>) : ParserMonad<'b> =
       bindM m k
-   
-    type ParserBuilder() = 
-        member inline self.ReturnFrom (ma:ParserMonad<'a>) : ParserMonad<'a> = ma
-        member inline self.Return x         = mreturn x
-        member inline self.Bind (p,f)       = bindM p f
-        member inline self.Zero a          = ParserMonad (fun input state -> Ok(a, state))
-        //member self.Combine (ma, mb) = ma >>= mb
 
-        // inspired from http://www.fssnip.net/7UJ/title/ResultBuilder-Computational-Expression
-        // probably broken
-        member inline self.TryFinally(m, compensation) =
-             try self.ReturnFrom(m)
-             finally compensation()
-        
-        //member self.Delay(f: unit -> ParserMonad<'a>) : ParserMonad<'a> = f ()
-        //member self.Using(res:#System.IDisposable, body) =
-        //      self.TryFinally(body res, fun () -> if not (isNull res) then res.Dispose())
-        //member self.While(guard, f) =
-        //       if not (guard()) then self.Zero () else
-        //       do f() |> ignore
-        //       self.While(guard, f)
-        //member self.For(sequence:seq<_>, body) =
-        //       self.Using(sequence.GetEnumerator(), fun enum -> self.While(enum.MoveNext, fun () -> self.Delay(fun () -> body enum.Current)))
-
-    let (parseMidi:ParserBuilder) = new ParserBuilder()
+    let parseMidi = monad
 
     let runParser (ma:ParserMonad<'a>) input initialState =
       apply1 ma input initialState
@@ -194,6 +172,16 @@ module ParserMonad =
     /// Throw a parse error
     let parseError (genMessage : Pos -> string) : ParserMonad<'a> = 
         ParserMonad <| fun _ st -> Error (mkOtherParseError st genMessage)
+
+    let fmapM (modify: 'a -> 'b) (parser : ParserMonad<'a>) : ParserMonad<'b> = 
+        ParserMonad <| fun input state -> 
+            match apply1 parser input state with
+            | Error err -> Error err
+            | Ok (a, st2) -> Ok (modify a, st2)
+
+    /// Operator for fmapM
+    let ( <<| ) (modify: 'a -> 'b) (parser : ParserMonad<'a>) : ParserMonad<'b> = 
+       fmapM modify parser
 
     /// Run the parser, if it fails swap the error message.
     let inline ( <??> ) (parser : ParserMonad<'a>) (genMessage : Pos -> string) : ParserMonad<'a> = 
@@ -301,66 +289,32 @@ module ParserMonad =
             work length state (fun msg -> Error msg) (fun st ac -> Ok (ac, st)) 
                 |> Result.map (fun (ans, st) -> (List.toArray ans, st))
 
-
     /// Run a parser within a bounded section of the input stream.
-    let repeatTillPosition (maxPosition: Pos) (p: ParserMonad<'a>) : ParserMonad<'a array> =
-        ParserMonad(fun data state ->
-            let results = ResizeArray()
-            let mutable firstError = Ok (Array.empty, state) 
-            let mutable lastState = state
-            let rec loop () =
-                if lastState.Position < int maxPosition then
-                    match apply1 p data lastState with
-                    | Ok (result, state) ->
-                        lastState <- state
-                        results.Add result
-                        loop ()
-                    | Error e ->
-                        firstError <- Error e
-
-            loop ()
-            match firstError with
-            | Ok _ ->
-                Ok(results.ToArray(), lastState)
-            | Error _ ->
-                firstError
-        )
-                        
-    let inline boundRepeat (n: ^T) (p: ParserMonad<'a>) : ParserMonad<'a array> =
-        ParserMonad(fun data state ->
-            let result = Array.zeroCreate (int n)
-            let mutable lastState = state
-// revisit with a fold?
-            let mutable error = Ok (Unchecked.defaultof<_>,lastState)
-            let mutable i = LanguagePrimitives.GenericZero
-            let mutable errorOccured = false
-            logf "bound repeat %i" n
-
-            while i < n && not errorOccured do
-                logf "bound repeat %i/%i" i n
-  
-                match apply1 p data lastState with
-                | Ok (item,state) ->
-                    lastState <- state
-                    result.[int i] <- item
-                | (Error e) ->
-                    error <- Error e
-                    errorOccured <- true
-                i <- i + LanguagePrimitives.GenericOne
-            if errorOccured then
-                error
-            else
-                Ok (result, lastState)
-            )
+    let repeatTillPosition (maxPosition: Pos) (parser: ParserMonad<'a>) : ParserMonad<'a array> =
+        ParserMonad <| fun input state -> 
+            let limit = maxPosition
+            let rec work (st : State) 
+                        (fk : ParseError -> Result<'a list * State, ParseError>) 
+                        (sk : State -> 'a list  -> Result<'a list * State, ParseError>) = 
+                match apply1 parser input st with
+                | Error a -> fk a
+                | Ok(a1, st1) -> 
+                    match compare st1.Position limit with
+                    | 0 -> sk st1 [a1]
+                    | t when t > 0 -> fk (ParseError(st1.Position, Other "repeatTillPosition - too far"))
+                    | _ -> 
+                        work st1 fk (fun st2 ac ->
+                            sk st2 (a1 :: ac))
+            work state (fun msg -> Error msg) (fun st ac -> Ok (ac, st)) 
+                |> Result.map (fun (ans, st) -> (List.toArray ans, st))
 
     /// Apply the parser for /count/ times, derive the final answer
     /// from the intermediate list with the supplied function.
     let inline gencount (plen: ParserMonad<'T>) (p: ParserMonad<'a>) (constr: ^T -> 'a array -> 'answer) : ParserMonad<'answer> =
         parseMidi {
-          let! l = plen
-          logf "gen count: l: %i" l
-          let! items = boundRepeat l p
-          return constr l items
+          let! times = plen
+          let! arr = count (int times) p
+          return (constr times arr)
         }
 
     /// Drop a byte (word8).
@@ -409,7 +363,7 @@ module ParserMonad =
         <??> sprintf "word14be: failed at %i"
 
     /// Parse a word32 (big endian).
-    let readUInt32be =
+    let readUInt32be : ParserMonad<_> =
       parseMidi {
         let! a = readByte
         let! b = readByte
@@ -419,7 +373,7 @@ module ParserMonad =
         }
 
     /// Parse a word24 (big endian).
-    let readWord24be =
+    let readWord24be : ParserMonad<_> =
         parseMidi {
             let! a = readByte
             let! b = readByte
